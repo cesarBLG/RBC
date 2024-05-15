@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project Sdk="Microsoft.NET.Sdk">
+   <PropertyGroup>
+    <TargetFramework>net472</TargetFramework>
+    <OutputType>Library</OutputType>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)' == 'Debug|AnyCPU'"/>
+  <ItemGroup>
+    <Reference Include="System" />
+    <Reference Include="Orts.Simulation">
+      <HintPath>..\Libs\Orts.Simulation.dll</HintPath>
+    </Reference>
+    <Reference Include="ORTS.Common">
+      <HintPath>..\Libs\ORTS.Common.dll</HintPath>
+    </Reference>
+    <Reference Include="Orts.Formats.Msts">
+      <HintPath>..\Libs\Orts.Formats.Msts.dll</HintPath>
+    </Reference>
+    <Reference Include="MonoGame.Framework">
+      <HintPath>..\Libs\MonoGame.Framework.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+</Project>
