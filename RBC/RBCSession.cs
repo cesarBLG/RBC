@@ -6,6 +6,8 @@ using Orts.Simulation.Signalling;
 using Orts.Simulation.Physics;
 using ORTS.Common;
 using Microsoft.Xna.Framework.Input;
+using System.Data.SqlTypes;
+using System.Threading.Tasks;
 namespace RBC
 {
     public class RBC_session
@@ -14,6 +16,7 @@ namespace RBC
         public bool Established;
         public int NID_ENGINE;
         public RBC_connection Connection;
+        readonly RBC Rbc;
         DateTime LocalReferenceTime;
         uint? ReferenceTimeStamp;
         uint? LastTrainTimeStamp;
@@ -27,9 +30,10 @@ namespace RBC
         Level CurrentLevel;
         float SpeedMpS;
         public static Signals Signals;
-        Dictionary<uint, (ETCSVariables,DateTime,int)> PendingAck = new Dictionary<uint, (ETCSVariables, DateTime, int)>();
+        Dictionary<uint, (ETCSVariables, DateTime, int)> PendingAck = new Dictionary<uint, (ETCSVariables, DateTime, int)>();
         Dictionary<int, int> PositionReportIndex = new Dictionary<int, int>();
         RouteInfo? SentInfo;
+        Task<RouteInfo> SendInfoTask;
         (int signal, Aspecto aspecto, DateTime time) NextSignalCleared;
         int EmergencyStopCount = 0;
         bool TrainDataAcknowledged = false;
@@ -37,18 +41,19 @@ namespace RBC
         Dictionary<int, SignalHead> EmergencyStops = new Dictionary<int, SignalHead>();
         Dictionary<int, bool> LevelCrossings = new Dictionary<int, bool>();
 
-        public static bool AllowTAF = false;
-        public static bool AllowOSbeforeFS = false;
-        public static bool ExtendOSRoute = false;
-        public static bool L2TransitionAnnouncementWithMA = false;
-        public static bool L2TransitionOrder = true;
-        public static bool MABeforeTransition = false;
-        public static bool ERTMSRoutes = false;
-        public static bool SHModeProfile = true;
-        public static int NID_C;
-        public static int NID_RBC;
+        public bool AllowTAF => Rbc.AllowTAF;
+        public bool AllowOSbeforeFS => Rbc.AllowOSbeforeFS;
+        public bool ExtendOSRoute => Rbc.ExtendOSRoute;
+        public bool L2TransitionAnnouncementWithMA => Rbc.L2TransitionAnnouncementWithMA;
+        public bool L2TransitionOrder => Rbc.L2TransitionOrder;
+        public bool MABeforeTransition => Rbc.MABeforeTransition;
+        public bool ERTMSRoutes => Rbc.ERTMSRoutes;
+        public bool SHModeProfile => Rbc.SHModeProfile;
+        public int NID_C => Rbc.NID_C;
+        public int NID_RBC => Rbc.NID_RBC;
+
         List<ETCSVariables> OptionalPackets = new List<ETCSVariables>();
-        public RBC_session(RBC_connection con, int nid_engine)
+        public RBC_session(RBC_connection con, RBC rbc, int nid_engine)
         {
             Establishing = true;
             textoAAspecto = Enum.GetNames(typeof(Aspecto)).ToDictionary(x => x, x => (Aspecto)Enum.Parse(typeof(Aspecto), x), StringComparer.OrdinalIgnoreCase);
@@ -64,6 +69,7 @@ namespace RBC
             PositionReportIndex[157] = 76;
             PositionReportIndex[158] = 82;
             Connection = con;
+            Rbc = rbc;
             NID_ENGINE = nid_engine;
         }
         public void Handle(ETCSVariables msg)
@@ -77,7 +83,7 @@ namespace RBC
             LastTrainTimeStamp = t_train; // Store T_TRAIN of last message
             var now = DateTime.UtcNow;
             if (ReferenceTimeStamp == null) ReferenceTimeStamp = t_train; // Set T_TRAIN as our origin of times if not already set
-            else ReferenceTimeStamp += (uint)(now.Subtract(LocalReferenceTime).TotalMilliseconds/10); // Advance time with measured elapsed time (prevent radio delays)
+            else ReferenceTimeStamp += (uint)(now.Subtract(LocalReferenceTime).TotalMilliseconds / 10); // Advance time with measured elapsed time (prevent radio delays)
             if (t_train - ReferenceTimeStamp > 6000 && ReferenceTimeStamp - t_train > 6000)
             {
                 // Clocks out of sync!!!
@@ -107,22 +113,60 @@ namespace RBC
                     revok.Push(2, 2);
                     revok.Push(23, 13);
                     OptionalPackets.Add(revok);
-                    /*var nation = new ETCSVariables();
-                    nation.Push(3, 8);
-                    nation.Push(1, 2);
-                    nation.Push(0, 13);
-                    nation.Push(1, 2);
-                    nation.Push(32767, 15);
-                    nation.Push(352, 10);
-                    nation.Push(0, 5);
-                    nation.Push(6, 7);
-                    nation.Push(20, 7);
-                    nation.Push(6, 7);
-                    nation.Push(20, 7);
-                    nation.Push(40, 7);
-                    nation.Push(6, 7);
-                    nation.Replace(10, nation.Length, 13);
-                    OptionalPackets.Add(nation);*/
+                }
+                if (position != null && (prevPosition == null || (prevPosition.Value.LRBG >> 14) != (position.Value.LRBG >> 14)))
+                {
+                    // National Values
+                    int nid_c = position.Value.LRBG >> 14;
+                    string nvset = GetParameter<string>(string.Format("NID_C.{0}", nid_c), "NV", null);
+                    if (nvset != null)
+                    {
+                        var nation = new ETCSVariables();
+                        nation.Push(3, 8);
+                        nation.Push(1, 2);
+                        nation.Push(0, 13);
+                        nation.Push(1, 2);
+                        nation.Push(32767, 15);
+                        nation.Push(nid_c, 10);
+                        List<int> nid_cs = GetParameter(nvset, "NID_Cs", "").Split(',').Select(int.Parse).ToList();
+                        nid_cs.Remove(nid_c);
+                        nation.Push(nid_cs.Count, 5);
+                        foreach (int nid in nid_cs)
+                        {
+                            nation.Push(nid, 10);
+                        }
+                        nation.Push(GetParameter(nvset, "V_NVSHUNT", 30) / 5, 7);
+                        nation.Push(GetParameter(nvset, "V_NVSTFF", 40) / 5, 7);
+                        nation.Push(GetParameter(nvset, "V_NVONSIGHT", 30) / 5, 7);
+                        nation.Push(GetParameter(nvset, "V_NVLIMSUPERV", 100) / 5, 7);
+                        nation.Push(GetParameter(nvset, "V_NVUNFIT", 100) / 5, 7);
+                        nation.Push(GetParameter(nvset, "V_NVREL", 40) / 5, 7);
+                        nation.Push(GetParameter(nvset, "D_NVROLL", 2), 15);
+                        nation.Push(GetParameter(nvset, "Q_NVSBTSMPERM", true) ? 1 : 0, 1);
+                        nation.Push(GetParameter(nvset, "Q_NVEMRRLS", false) ? 1 : 0, 1);
+                        nation.Push(GetParameter(nvset, "Q_NVGUIPERM", false) ? 1 : 0, 1);
+                        nation.Push(GetParameter(nvset, "Q_NVSBFBPERM", false) ? 1 : 0, 1);
+                        nation.Push(GetParameter(nvset, "Q_NVINHSMICPERM", false) ? 1 : 0, 1);
+                        nation.Push(GetParameter(nvset, "V_NVALLOWOVTRP", 0) / 5, 7);
+                        nation.Push(GetParameter(nvset, "V_NVSUPOVTRP", 30) / 5, 7);
+                        nation.Push(GetParameter(nvset, "D_NVOVTRP", 200), 15);
+                        nation.Push(GetParameter(nvset, "T_NVOVTRP", 60), 8);
+                        nation.Push(GetParameter(nvset, "D_NVPOTRP", 200), 15);
+                        nation.Push(GetParameter(nvset, "M_NVCONTACT", 1), 2);
+                        nation.Push(GetParameter(nvset, "T_NVCONTACT", 255), 8);
+                        nation.Push(GetParameter(nvset, "M_NVDERUN", 1), 1);
+                        nation.Push(GetParameter(nvset, "D_NVSTFF", 32767), 15);
+                        nation.Push(GetParameter(nvset, "Q_NVDRIVER_ADHES", false) ? 1 : 0, 1);
+                        nation.Push(GetParameter(nvset, "A_NVMAXREDADH1", 20), 6);
+                        nation.Push(GetParameter(nvset, "A_NVMAXREDADH2", 14), 6);
+                        nation.Push(GetParameter(nvset, "A_NVMAXREDADH3", 14), 6);
+                        nation.Push(GetParameter(nvset, "Q_NVLOCACC", 12), 6);
+                        nation.Push(GetParameter(nvset, "M_NVAVADH", 0), 5);
+                        nation.Push(GetParameter(nvset, "M_NVEBCL", 9), 4);
+                        nation.Push(0, 1);
+                        nation.Replace(10, nation.Length, 13);
+                        OptionalPackets.Add(nation);
+                    }
                 }
                 if ((prevL == Level.L2 && CurrentLevel != Level.L2) || CurrentMode == Mode.SH || CurrentMode == Mode.SL)
                 {
@@ -213,11 +257,11 @@ namespace RBC
                             {
                                 var info = SentInfo.Value;
                                 info.EndSignal = EmergencyStops[id];
-                                for (int i=0; i<info.Signals.Count-1; i++)
+                                for (int i = 0; i < info.Signals.Count - 1; i++)
                                 {
                                     if (info.Signals[i].Item1 == info.EndSignal)
                                     {
-                                        info.Signals.RemoveRange(i+1, info.Signals.Count - i - 1);
+                                        info.Signals.RemoveRange(i + 1, info.Signals.Count - i - 1);
                                         break;
                                     }
                                 }
@@ -377,7 +421,7 @@ namespace RBC
             if (position.Value.BackFacing)
                 taf.Push((int)shift, 16);
             else
-                taf.Push((((int)shift)^65535)+1, 16);
+                taf.Push((((int)shift) ^ 65535) + 1, 16);
             taf.Push(position.Value.BackFacing ? 0 : 1, 2);
             taf.Push(start, 15);
             taf.Push(length, 15);
@@ -433,7 +477,7 @@ namespace RBC
             {
                 bool level2 = false;
                 int signals = 0;
-                for (int iindex=0; iindex<TrainRoute.Count; iindex++)
+                for (int iindex = 0; iindex < TrainRoute.Count; iindex++)
                 {
                     var element = TrainRoute[iindex];
                     var tc = Signals.TrackCircuitList[element.TCSectionIndex];
@@ -454,6 +498,11 @@ namespace RBC
                     TerminateSession();
                 }
             }
+            if (SendInfoTask != null && SendInfoTask.IsCompleted)
+            {
+                SentInfo = SendInfoTask.Result;
+                SendInfoTask = null;
+            }
             RouteInfo? routeInfo = null;
             if (TrainPosition != null)
             {
@@ -466,7 +515,7 @@ namespace RBC
             if (position != null && SentInfo != null)
             {
                 int changed = -1;
-                for (int i=0; i<SentInfo.Value.Signals.Count; i++)
+                for (int i = 0; i < SentInfo.Value.Signals.Count; i++)
                 {
                     // ADIF: send emergency stop when a signal is closed
                     var sig = SentInfo.Value.Signals[i];
@@ -495,7 +544,7 @@ namespace RBC
                             if (position.Value.BackFacing)
                                 stop.Push((int)dist, 16);
                             else
-                                stop.Push((((int)dist)^65535)+1, 16);
+                                stop.Push((((int)dist) ^ 65535) + 1, 16);
                             dist = 0;
                         }
                         else stop.Push(0, 16);
@@ -522,10 +571,10 @@ namespace RBC
             }
             if (routeInfo != null)
             {
-                var newLX = new Dictionary<int,bool>();
+                var newLX = new Dictionary<int, bool>();
                 float offset = LRBGPosition.TCOffset;
                 float totalLength = 0;
-                for (int iindex=0; iindex<routeInfo.Value.ClearedRoute.Count; iindex++)
+                for (int iindex = 0; iindex < routeInfo.Value.ClearedRoute.Count; iindex++)
                 {
                     var element = routeInfo.Value.ClearedRoute[iindex];
                     var tc = Signals.TrackCircuitList[element.TCSectionIndex];
@@ -533,7 +582,7 @@ namespace RBC
                     var lxs = tc.CircuitItems.TrackCircuitSignals[dir][Signals.SignalFunctions["OLPN_T"]].TrackCircuitItem;
                     foreach (var lx in lxs)
                     {
-                        int id = (lx.SignalRef.thisRef&127)|128;
+                        int id = (lx.SignalRef.thisRef & 127) | 128;
                         bool is_protected = lx.SignalRef.SignalHeads[0].state == MstsSignalAspect.APPROACH_2 || lx.SignalRef.SignalHeads[0].state == MstsSignalAspect.CLEAR_2;
                         float dist = lx.SignalLocation - offset + totalLength;
                         float distToTrain = dist - position.Value.MaxSafe;
@@ -584,7 +633,7 @@ namespace RBC
                 }
             }
             // Reset T_NVCONTACT
-            if (Established && (((CurrentMode == Mode.FS || CurrentMode == Mode.OS) && DateTime.UtcNow - Connection.LastSentMessage > TimeSpan.FromSeconds(10)) || OptionalPackets.Count > 0))
+            if (Established && (((CurrentMode == Mode.FS || CurrentMode == Mode.OS) && DateTime.UtcNow - Connection.LastSentMessage > TimeSpan.FromSeconds(10) && EmergencyStops.Count == 0) || OptionalPackets.Count > 0))
             {
                 var empty = new ETCSVariables();
                 empty.Push(24, 8);
@@ -612,8 +661,8 @@ namespace RBC
         }
         int GetCoordinateSystem(int lrbg1, int lrbg2)
         {
-            var sig1 = Signals.SignalObjects[lrbg1&16383];
-            var sig2 = Signals.SignalObjects[lrbg2&16383];
+            var sig1 = Signals.SignalObjects[lrbg1 & 16383];
+            var sig2 = Signals.SignalObjects[lrbg2 & 16383];
             var tc1 = Signals.TrackCircuitList[sig1.TCReference];
             var tc2 = Signals.TrackCircuitList[sig2.TCReference];
             return 1;
@@ -639,8 +688,9 @@ namespace RBC
             public SignalHead EndSignal;
             public int? OSProfileStart;
             public int? OSProfileEnd;
-            public int? SHProfileStart;
+            public float? SHProfileStart;
             public float FirstL2Signal;
+            public bool RBCBorder;
         }
         public enum Aspecto
         {
@@ -681,10 +731,10 @@ namespace RBC
                 MaxTrainPosition = null;
                 return;
             }
-            var lrbg = Signals.SignalObjects[position.Value.LRBG&16383];
+            var lrbg = Signals.SignalObjects[position.Value.LRBG & 16383];
             var tc = Signals.TrackCircuitList[lrbg.TCReference];
             bool reverse = position.Value.BackFacing;
-            int dir = reverse ? (1-lrbg.TCDirection) : lrbg.TCDirection;
+            int dir = reverse ? (1 - lrbg.TCDirection) : lrbg.TCDirection;
             float offset = reverse ? tc.Length - lrbg.TCOffset : lrbg.TCOffset;
             int index = TrainRoute.GetRouteIndex(lrbg.TCReference, 0);
             if (index >= 0) TrainRoute.RemoveRange(0, index);
@@ -699,11 +749,11 @@ namespace RBC
             if (TrainRoute.Count == 0) TrainRoute.Add(new Train.TCRouteElement(tc, dir, Signals, -2));
             // If route ends before train position, extend
             float totalLength = TrainRoute.Select(x => Signals.TrackCircuitList[x.TCSectionIndex].Length).Sum() - offset;
-            if (totalLength <= position.Value.Distance)
+            if (totalLength <= position.Value.MaxSafe)
             {
-                var lastElement = TrainRoute[TrainRoute.Count-1];
+                var lastElement = TrainRoute[TrainRoute.Count - 1];
                 var tempSections = Signals.ScanRoute(null, lastElement.TCSectionIndex, 0, lastElement.Direction, true,
-                                            position.Value.Distance - totalLength + Signals.TrackCircuitList[lastElement.TCSectionIndex].Length,
+                                            position.Value.MaxSafe - totalLength + Signals.TrackCircuitList[lastElement.TCSectionIndex].Length,
                                             true, false, false, false, true, false, false, false, false, false);
                 tempSections.RemoveAt(0);
                 int prevSection = lastElement.TCSectionIndex;
@@ -722,7 +772,7 @@ namespace RBC
             // Find train position
             totalLength = -LRBGPosition.TCOffset;
             if (position.Value.Distance < totalLength) return;
-            for (int i=0; i<TrainRoute.Count && (TrainPosition == null || MaxTrainPosition == null); i++)
+            for (int i = 0; i < TrainRoute.Count && (TrainPosition == null || MaxTrainPosition == null); i++)
             {
                 var element = TrainRoute[i];
                 tc = Signals.TrackCircuitList[element.TCSectionIndex];
@@ -757,7 +807,7 @@ namespace RBC
             // Extend route from the train
             {
                 var tempSections = Signals.ScanRoute(null, TrainPosition.TCSectionIndex, TrainPosition.TCOffset, TrainPosition.TCDirection, true, 32000, true, false, false, false, true, false, false, false, false, false);
-                int prevSection = TrainRoute.Count > 0 ? TrainRoute[TrainRoute.Count-1].TCSectionIndex : -2;
+                int prevSection = TrainRoute.Count > 0 ? TrainRoute[TrainRoute.Count - 1].TCSectionIndex : -2;
                 foreach (int sectionIndex in tempSections)
                 {
                     int sectionDirection = sectionIndex > 0 ? 0 : 1;
@@ -779,11 +829,11 @@ namespace RBC
                 OSProfileStart = null,
                 OSProfileEnd = null,
                 SHProfileStart = null,
+                RBCBorder = false,
             };
             if (CurrentMode == Mode.OS) info.OSProfileStart = -1;
             float offset = LRBGPosition.TCOffset;
-            //float trainPosition = TrainRoute.GetDistanceAlongRoute(0, Signals.TrackCircuitList[LRBGPosition.TCSectionIndex].Length - LRBGPosition.TCOffset, MaxTrainPosition.RouteListIndex, MaxTrainPosition.TCOffset, true, Signals);
-            float trainPosition = TrainRoute.GetDistanceAlongRoute(0, Signals.TrackCircuitList[LRBGPosition.TCSectionIndex].Length - LRBGPosition.TCOffset, TrainPosition.RouteListIndex, TrainPosition.TCOffset, true, Signals);
+            float trainPosition = TrainRoute.GetDistanceAlongRoute(0, Signals.TrackCircuitList[LRBGPosition.TCSectionIndex].Length - LRBGPosition.TCOffset, MaxTrainPosition.RouteListIndex, MaxTrainPosition.TCOffset, true, Signals);
             float totalLength = 0;
             bool findPlatform = false;
             int? id1 = null;
@@ -797,7 +847,7 @@ namespace RBC
                     if (id2 < TrainPosition.RouteListIndex) id1 = id2 = null;
                 }
             }
-            for (int iindex=0; iindex<TrainRoute.Count; iindex++)
+            for (int iindex = 0; iindex < TrainRoute.Count; iindex++)
             {
                 var element = TrainRoute[iindex];
                 var tc = Signals.TrackCircuitList[element.TCSectionIndex];
@@ -865,7 +915,7 @@ namespace RBC
                             }
                         }
 
-                        if (NextSignalCleared.signal == signal.thisRef && (DateTime.UtcNow-NextSignalCleared.time).Seconds < 10 &&
+                        if (NextSignalCleared.signal == signal.thisRef && (DateTime.UtcNow - NextSignalCleared.time).Seconds < 10 &&
                             asp == Aspecto.Parada && NextSignalCleared.aspecto != Aspecto.Parada && info.NextSignal - position.Value.MaxSafe < 50)
                             asp = NextSignalCleared.aspecto;
                         if (asp == Aspecto.RebaseAutorizadoDestellos)
@@ -880,7 +930,7 @@ namespace RBC
                         if (asp == Aspecto.Parada) break;
                         if (asp == Aspecto.RebaseAutorizado || asp == Aspecto.RebaseAutorizadoCortaDistancia)
                         {
-                            if (SHModeProfile && totalLength - trainPosition < 50) info.SHProfileStart = signal.TCNextTC;
+                            if (SHModeProfile && !retroceso && info.Signals.Count == 1) info.SHProfileStart = totalLength;
                             break;
                         }
                         if (asp == Aspecto.ParadaLZB || asp == Aspecto.ParadaSelectiva)
@@ -893,7 +943,7 @@ namespace RBC
                         }
                         if (!retroceso && level2 && CurrentLevel == Level.L2 && CurrentMode == Mode.FS && ERTMSRoutes) signal.SignalHeads[0].usedCsSignalScript?.HandleSignalMessage(-1, "ERTMS_ROUTE");
                     }
-                    else if (level2 && !retroceso && position.Value.MinSafe - totalLength < 50 && NextSignalCleared.signal == signal.thisRef && (DateTime.UtcNow-NextSignalCleared.time).Seconds < 10 && NextSignalCleared.aspecto != Aspecto.Parada)
+                    else if (level2 && !retroceso && position.Value.MinSafe - totalLength < 50 && NextSignalCleared.signal == signal.thisRef && (DateTime.UtcNow - NextSignalCleared.time).Seconds < 10 && NextSignalCleared.aspecto != Aspecto.Parada)
                     {
                         if (NextSignalCleared.aspecto != Aspecto.RebaseAutorizadoDestellos && asp != Aspecto.RebaseAutorizadoDestellos) info.OSProfileStart = null;
                         else if (!info.OSProfileStart.HasValue)
@@ -934,15 +984,15 @@ namespace RBC
                     s => s.SignalLocation > offset && s.SignalRef.SignalHeads[0].TextSignalAspect.Substring(9, 3) == "000"
                 ).Select(
                     s => new LinkingElement(s.SignalRef.thisRef, s.SignalLocation + totalLength - offset, false)));
-                /*balises.AddRange(tc.CircuitItems.TrackCircuitSignals[1-element.Direction][Signals.SignalFunctions["ETCS"]].TrackCircuitItem
+                balises.AddRange(tc.CircuitItems.TrackCircuitSignals[1-element.Direction][Signals.SignalFunctions["ETCS"]].TrackCircuitItem
                 .Where(
-                    s => tc.Length - s.SignalLocation > offset && s.SignalRef.SignalHeads[0].TextSignalAspect.Substring(9, 3) == "000"
+                    s => tc.Length - s.SignalLocation > offset && s.SignalRef.SignalHeads[0].TextSignalAspect.Substring(9, 3) == "000" && s.SignalRef.this_sig_lvar(120) >= 0
                 ).Select(
-                    s => new LinkingElement(s.SignalRef.thisRef, tc.Length - s.SignalLocation + totalLength - offset, true)));*/
+                    s => new LinkingElement(s.SignalRef.thisRef, tc.Length - s.SignalLocation + totalLength - offset, true)));
                 offset = 0;
                 totalLength = endLength;
             }
-            balises.Sort((x,y) => x.DistanceM.CompareTo(y.DistanceM));
+            balises.Sort((x, y) => x.DistanceM.CompareTo(y.DistanceM));
             if (balises.Count > 0)
             {
                 var msg = new ETCSVariables();
@@ -968,17 +1018,18 @@ namespace RBC
         }
         bool TrySendInfo(RouteInfo info, bool taf)
         {
+            if (SendInfoTask != null) return true;
             if (EmergencyStops.Count != 0 || !TrainDataAcknowledged) return false;
-            bool reverse = position.Value.BackFacing;
             // ADIF: transition to L2 FS only allowed when distance to main signal < 50m
             // If already in FS, route is assumed to be cleared up to next signal, so MA is always extended if possible
             bool confidenceArea = info.NextSignal - position.Value.MaxSafe < (taf ? 500 : 50) && position.Value.MinSafe - info.NextSignal < 50;
             float levelTransitionLocation = float.MaxValue;
             SignalHead l2TransitionSignal = null;
+            // The following line is added to prevent train entering FS again when pressing "Override"
             if (CurrentMode == Mode.SR && info.Signals.Count > 0 && info.Signals[info.Signals.Count - 1].Item3 - position.Value.MaxSafe < 50 && !info.SHProfileStart.HasValue) return false;
             if (CurrentLevel == Level.L2)
             {
-                if (confidenceArea) {}
+                if (confidenceArea) { }
                 else if (CurrentMode == Mode.FS)
                 {
                     bool extend = false;
@@ -1016,15 +1067,18 @@ namespace RBC
                         break;
                     }
                 }
-                if (confidenceArea) {}
+                if (confidenceArea) { }
                 else if (MABeforeTransition)
                 {
                     if (levelTransitionLocation - position.Value.Distance > Math.Max(SpeedMpS * 15, 1500)) return false;
                 }
                 else return false;
             }
-            SentInfo = info;
-
+            SendInfoTask = SendInfo(info, levelTransitionLocation, l2TransitionSignal);
+            return true;
+        }
+        async Task<RouteInfo> SendInfo(RouteInfo info, float levelTransitionLocation = float.MaxValue, SignalHead l2TransitionSignal = null)
+        {
             float shift = position.Value.Distance < 0 ? LRBGPosition.TCOffset : 0;
             info.MAEnd += shift;
 
@@ -1032,36 +1086,36 @@ namespace RBC
             List<SpeedElement> speedElements;
             var Gradient = new List<(double, double)>();
             var TrackConditions = new List<(double, double, int)>();
-            {  
+            {
                 var speedPosts = new List<(double, ObjectSpeedInfo)>();
                 var backSpeedPosts = new List<(double, ObjectSpeedInfo)>();
                 double currentGradient = float.MaxValue;
-                double currentAltitude = Signals.SignalObjects[position.Value.LRBG&16383].tdbtraveller.WorldLocation.Location.Y;
+                double currentAltitude = Signals.SignalObjects[position.Value.LRBG & 16383].tdbtraveller.WorldLocation.Location.Y;
                 double prevGradDist = 0;
                 double currentGradDist = 0;
                 float offset = LRBGPosition.TCOffset - shift;
                 float totalLength = 0;
                 var tunnels = new List<(double, double)>();
                 var infoSignals = new List<(double, SignalObject)>();
-                List<string> ignoreSpeedPosts = new List<string>{"placa_2dig","placa_3dig","placa_4dig","lav_rasante1","lav_rasante2","lav_rasante3","lav_rasante4"};
-                for (int iindex=0; iindex<info.ClearedRoute.Count; iindex++)
+                List<string> ignoreSpeedPosts = new List<string> { "placa_2dig", "placa_3dig", "placa_4dig", "lav_rasante1", "lav_rasante2", "lav_rasante3", "lav_rasante4" };
+                for (int iindex = 0; iindex < info.ClearedRoute.Count; iindex++)
                 {
                     var element = info.ClearedRoute[iindex];
                     var tc = Signals.TrackCircuitList[element.TCSectionIndex];
                     int dir = element.Direction;
-                    
+
                     foreach (var s in tc.CircuitItems.TrackCircuitSpeedPosts[dir].TrackCircuitItem)
                     {
-                        if (s.SignalLocation > offset && !ignoreSpeedPosts.Contains(s.SignalRef.SignalHeads[0].SignalTypeName.ToLowerInvariant()))
+                        if (s.SignalLocation >= offset && !ignoreSpeedPosts.Contains(s.SignalRef.SignalHeads[0].SignalTypeName.ToLowerInvariant()))
                         {
                             var speed = s.SignalRef.this_lim_speed(SignalFunction.SPEED);
                             if (!speed.speed_isWarning && speed.speed_pass > 0 && speed.speed_pass < 900)
                                 speedPosts.Add(((double)s.SignalLocation + totalLength - offset, speed));
                         }
                     }
-                    foreach (var s in tc.CircuitItems.TrackCircuitSpeedPosts[1-dir].TrackCircuitItem)
+                    foreach (var s in tc.CircuitItems.TrackCircuitSpeedPosts[1 - dir].TrackCircuitItem)
                     {
-                        if (tc.Length - s.SignalLocation > offset && !ignoreSpeedPosts.Contains(s.SignalRef.SignalHeads[0].SignalTypeName.ToLowerInvariant()))
+                        if (tc.Length - s.SignalLocation >= offset && !ignoreSpeedPosts.Contains(s.SignalRef.SignalHeads[0].SignalTypeName.ToLowerInvariant()))
                         {
                             var speed = s.SignalRef.this_lim_speed(SignalFunction.SPEED);
                             if (!speed.speed_isWarning && speed.speed_pass > 0 && speed.speed_pass < 900)
@@ -1088,13 +1142,13 @@ namespace RBC
                             else break;
                         }
                     }
-                    infoSignals.AddRange(tc.CircuitItems.TrackCircuitSignals[dir][Signals.SignalFunctions["INFO"]].TrackCircuitItem.Where(s => s.SignalLocation >= offset).Select(s => ((double)s.SignalLocation + totalLength, s.SignalRef)).ToList());
+                    infoSignals.AddRange(tc.CircuitItems.TrackCircuitSignals[dir][Signals.SignalFunctions["INFO"]].TrackCircuitItem.Where(s => s.SignalLocation >= offset).Select(s => ((double)s.SignalLocation + totalLength - offset, s.SignalRef)).ToList());
                     {
                         if (tc.EndSignals[dir] != null)
                         {
-                            float dist = totalLength+tc.Length-offset;
+                            float dist = totalLength + tc.Length - offset;
                             float alt = tc.EndSignals[dir].tdbtraveller.WorldLocation.Location.Y;
-                            Gradient.Add((currentGradDist, (alt-currentAltitude)/(dist-currentGradDist)*1000));
+                            Gradient.Add((currentGradDist, (alt - currentAltitude) / (dist - currentGradDist) * 1000));
                             currentGradDist = dist;
                             currentAltitude = alt;
                         }
@@ -1154,11 +1208,11 @@ namespace RBC
                 if (Gradient.Count > 32)
                 {
                     double min = float.MaxValue;
-                    for (int i=31; i<Gradient.Count; i++)
+                    for (int i = 31; i < Gradient.Count; i++)
                     {
                         min = Math.Min(min, Gradient[i].Item2);
                     }
-                    Gradient.RemoveRange(32, Gradient.Count-32);
+                    Gradient.RemoveRange(32, Gradient.Count - 32);
                     Gradient[31] = (Gradient[31].Item1, min);
                 }
 
@@ -1168,11 +1222,11 @@ namespace RBC
                 if (prevSpeedElements.Count > 0) currentSpeedElement = prevSpeedElements.Last();
                 else if (backfacingSpeedElements.Count > 0) currentSpeedElement = backfacingSpeedElements.First();
                 else if (speedElements.Count > 0) currentSpeedElement = speedElements.First();
-                else currentSpeedElement = new SpeedElement(0, 350/3.6);
+                else currentSpeedElement = new SpeedElement(0, 350 / 3.6);
                 currentSpeedElement.Position = 0;
 
                 TrackConditions.AddRange(tunnels.Select(t => (t.Item1, t.Item2, 0)));
-                TrackConditions.AddRange(tunnels.Select(t => (t.Item1, t.Item2, 5))); 
+                TrackConditions.AddRange(tunnels.Select(t => (t.Item1, t.Item2, 5)));
                 // Neutral sections
                 for (int i = 0; i < infoSignals.Count; i++)
                 {
@@ -1207,12 +1261,12 @@ namespace RBC
                     }
                     else continue;
                     double length = 200;
-                    for (int j = 0; i+j < infoSignals.Count; j++)
+                    for (int j = 0; i + j < infoSignals.Count; j++)
                     {
                         var element2 = infoSignals[i + j];
                         if (element2.Item2.SignalHeads[0].SignalTypeName == endname)
                         {
-                            length = element2.Item1-element.Item1;
+                            length = element2.Item1 - element.Item1;
                             break;
                         }
                     }
@@ -1221,6 +1275,32 @@ namespace RBC
                 }
                 TrackConditions.Sort((x, y) => x.Item1.CompareTo(y.Item1));
             }
+
+            // TODO: RBC-RBC
+            if (info.RBCBorder)
+            {
+                float remdist = Math.Max(32000 - info.MAEnd, 0);
+                var rrireq = new ETCSVariables();
+                rrireq.Push(202, 8);
+                int pos = rrireq.Offset;
+                rrireq.Push((int)remdist, 15);
+                rrireq.Push(31, 5);
+                rrireq.Push(10, 5);
+                rrireq.Push(1, 1);
+                rrireq.Push(0, 5);
+                rrireq.Push(32 - Gradient.Count, 5);
+                rrireq.Push(6, 5);
+                rrireq.Push(31 - speedElements.Count, 5);
+                rrireq.Push(Math.Min(32 - TrackConditions.Count, 20), 5);
+
+                /*var rri = await hov;
+                if (rri != null)
+                {
+
+                }*/
+            }
+
+            bool reverse = position.Value.BackFacing;
             var msg = new ETCSVariables();
             if (shift == 0)
             {
@@ -1241,7 +1321,7 @@ namespace RBC
                 if (position.Value.BackFacing)
                     msg.Push((int)shift, 16);
                 else
-                    msg.Push((((int)shift)^65535)+1, 16);
+                    msg.Push((((int)shift) ^ 65535) + 1, 16);
             }
 
             msg.Push(15, 8); // MA
@@ -1294,19 +1374,16 @@ namespace RBC
             }
             else if (info.SHProfileStart.HasValue)
             {
-                //int id1 = info.ClearedRoute.GetRouteIndex(info.SHProfileStart.Value, 0);
-                float profileStart = info.NextSignal;
-                //if (id1 >= 0) profileStart = info.ClearedRoute.GetDistanceAlongRoute(0, Signals.TrackCircuitList[LRBGPosition.TCSectionIndex].Length - (LRBGPosition.TCOffset - shift), id1, 0, true, Signals);
                 start = msg.Length;
                 msg.Push(80, 8); // SH mode profile
                 msg.Push(reverse ? 0 : 1, 2);
                 msg.Push(0, 13);
                 msg.Push(1, 2);
-                msg.Push((int)profileStart, 15);
+                msg.Push((int)(info.SHProfileStart.Value + shift), 15);
                 msg.Push(1, 2);
                 msg.Push(6, 7);
                 msg.Push(32767, 15);
-                msg.Push(300, 15);
+                msg.Push(50, 15);
                 msg.Push(1, 1);
                 msg.Push(0, 5);
                 msg.Replace(start + 10, msg.Length - start, 13);
@@ -1318,12 +1395,13 @@ namespace RBC
             msg.Push(0, 13);
             msg.Push(1, 2);
             double last = 0;
-            for (int i=0; i<Gradient.Count; i++) {
+            for (int i = 0; i < Gradient.Count; i++)
+            {
                 var gr = Gradient[i];
                 msg.Push((int)(gr.Item1 - last), 15);
                 msg.Push(gr.Item2 > 0 ? 1 : 0, 1);
                 msg.Push((int)Math.Abs(gr.Item2), 8);
-                if (i==0) msg.Push(Gradient.Count-1, 5);
+                if (i == 0) msg.Push(Gradient.Count - 1, 5);
                 last = gr.Item1;
             }
             msg.Replace(start + 10, msg.Length - start, 13);
@@ -1357,7 +1435,7 @@ namespace RBC
                 msg.Push(1, 2);
                 msg.Push(0, 1);
                 double dist = 0;
-                for (int i=0; i<TrackConditions.Count; i++)
+                for (int i = 0; i < TrackConditions.Count; i++)
                 {
                     var cond = TrackConditions[i];
                     msg.Push((int)(cond.Item1 - dist), 15);
@@ -1385,7 +1463,7 @@ namespace RBC
                     msg.Push(order ? 32767 : (int)(levelTransitionLocation + shift + 50), 15);
                     msg.Push(3, 3);
                     msg.Push((int)lack, 15);
-                    List<(int,int)> backupLevels = new List<(int,int)>();
+                    List<(int, int)> backupLevels = new List<(int, int)>();
                     if (l2TransitionSignal != null)
                     {
                         int r = l2TransitionSignal.this_sig_lvar(200);
@@ -1395,7 +1473,7 @@ namespace RBC
                     }
                     backupLevels.Add((0, 0));
                     msg.Push(backupLevels.Count, 5);
-                    for (int i=0; i<backupLevels.Count; i++)
+                    for (int i = 0; i < backupLevels.Count; i++)
                     {
                         msg.Push(backupLevels[i].Item1, 3);
                         if (backupLevels[i].Item1 == 1) msg.Push(backupLevels[i].Item2, 8);
@@ -1407,7 +1485,7 @@ namespace RBC
             }
 
             SendMessage(msg, true);
-            return true;
+            return info;
         }
         TrainPosition? ReadPositionReport(ETCSVariables pack)
         {
@@ -1527,7 +1605,7 @@ namespace RBC
             }
             public void WriteTo(ETCSVariables var, double last)
             {
-                var.Push((int)(Position-last), 15);
+                var.Push((int)(Position - last), 15);
                 var.Push((int)(Speeds[-1] * 3.6 / 5), 7);
                 var.Push(Front ? 1 : 0, 1);
                 var.Push(Speeds.Count - 1, 5);
@@ -1542,7 +1620,7 @@ namespace RBC
         }
         List<SpeedElement> BuildSpeedElements(List<(double, ObjectSpeedInfo)> speedposts)
         {
-            speedposts.Sort((x,y) => x.Item1.CompareTo(y.Item1));
+            speedposts.Sort((x, y) => x.Item1.CompareTo(y.Item1));
             List<SpeedElement> elements = new List<SpeedElement>();
             int num = -1;
             double lastpos = float.MinValue;
@@ -1585,12 +1663,12 @@ namespace RBC
 
             TrackCircuitSection thisSection = Signals.TrackCircuitList[sectionIndex];
 
-            float offset = thisSection.Length-LRBGPosition.TCOffset;
+            float offset = thisSection.Length - LRBGPosition.TCOffset;
 
             float totalLength = 0;
 
             List<int> foundItems = new List<int>();
-            List<string> ignoreSpeedPosts = new List<string>{"placa_2dig","placa_3dig","placa_4dig","lav_rasante1","lav_rasante2","lav_rasante3","lav_rasante4"};
+            List<string> ignoreSpeedPosts = new List<string> { "placa_2dig", "placa_3dig", "placa_4dig", "lav_rasante1", "lav_rasante2", "lav_rasante3", "lav_rasante4" };
             while (speedPosts.Count == 0)
             {
                 // check looped
@@ -1710,6 +1788,13 @@ namespace RBC
             if (ack) PendingAck[LastTimeStamp] = (msg, DateTime.UtcNow, 0);
             Connection?.Send(msg);
             LastTimeStamp++;
+        }
+        
+        T GetParameter<T>(string region, string param, T defaultValue)
+        {
+            T val = defaultValue;
+            if (region != null) Rbc.LoadParameter(region, param, ref val);
+            return val;
         }
     }
 }

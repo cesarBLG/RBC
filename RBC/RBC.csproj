@@ -10,8 +10,8 @@
     <Reference Include="Orts.Simulation">
       <HintPath>..\Libs\Orts.Simulation.dll</HintPath>
     </Reference>
-    <Reference Include="ORTS.Common">
-      <HintPath>..\Libs\ORTS.Common.dll</HintPath>
+    <Reference Include="Orts.Common">
+      <HintPath>..\Libs\Orts.Common.dll</HintPath>
     </Reference>
     <Reference Include="Orts.Formats.Msts">
       <HintPath>..\Libs\Orts.Formats.Msts.dll</HintPath>

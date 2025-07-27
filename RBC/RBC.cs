@@ -33,45 +33,59 @@ namespace RBC
         List<RBC_connection> Connections = new List<RBC_connection>();
         Task<Socket> ListenTask = null;
         Socket Listener;
+
+        public bool AllowTAF = false;
+        public bool AllowOSbeforeFS = false;
+        public bool ExtendOSRoute = false;
+        public bool L2TransitionAnnouncementWithMA = false;
+        public bool L2TransitionOrder = true;
+        public bool MABeforeTransition = false;
+        public bool ERTMSRoutes = false;
+        public bool SHModeProfile = true;
+        public int NID_C;
+        public int NID_RBC;
+
         public static Random random = new Random();
         public RBC(int NID_C, int NID_RBC, int port=0x7911)
         {
             Signals signals = MPManager.Simulator.Signals;
             RBC_session.Signals = signals;
             
-            RBC_session.NID_C = NID_C;
-            RBC_session.NID_RBC = NID_RBC;
+            this.NID_C = NID_C;
+            this.NID_RBC = NID_RBC;
 
-            string network = "ADIF";
-            if (network == "ADIF")
+            string section = string.Format("NID_C.{0}", NID_C);
+            string ruleset = "ADIF_AV";
+            LoadParameter(section, "Rules", ref ruleset);
+            if (ruleset == "ADIF_CONV" || ruleset == "ADIF_AV")
             {
-                RBC_session.AllowOSbeforeFS = false;
-                RBC_session.AllowTAF = false;
-                RBC_session.L2TransitionAnnouncementWithMA = true;
-                RBC_session.L2TransitionOrder = true;
-                RBC_session.MABeforeTransition = true;
+                AllowOSbeforeFS = false;
+                AllowTAF = false;
+                L2TransitionAnnouncementWithMA = true;
+                L2TransitionOrder = true;
+                MABeforeTransition = true;
             }
             else
             {
-                RBC_session.AllowOSbeforeFS = true;
-                RBC_session.AllowTAF = false;
-                RBC_session.L2TransitionAnnouncementWithMA = true;
-                RBC_session.L2TransitionOrder = false;
-                RBC_session.MABeforeTransition = true;
+                AllowOSbeforeFS = true;
+                AllowTAF = false;
+                L2TransitionAnnouncementWithMA = true;
+                L2TransitionOrder = false;
+                MABeforeTransition = true;
             }
-            LoadParameter("RBC","OsBeforeFs", ref RBC_session.AllowOSbeforeFS);
-            LoadParameter("RBC","TAF", ref RBC_session.AllowTAF);
-            LoadParameter("RBC","ERTMSRoutes", ref RBC_session.ERTMSRoutes);
-            LoadParameter("RBC","ShProfile", ref RBC_session.SHModeProfile);
+            LoadParameter(section,"OsBeforeFs", ref AllowOSbeforeFS);
+            LoadParameter(section,"TAF", ref AllowTAF);
+            LoadParameter(section,"ERTMSRoutes", ref ERTMSRoutes);
+            LoadParameter(section,"ShProfile", ref SHModeProfile);
             
             IPEndPoint localEndPoint = new IPEndPoint(IPAddress.Any, port);
             Listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
             Listener.Bind(localEndPoint);
             Listener.Listen(10);
         }
-        private void LoadParameter<T>(string sectionName, string keyName, ref T value)
+        public void LoadParameter<T>(string sectionName, string keyName, ref T value)
         {
-            string file = Path.Combine(MPManager.Simulator.RoutePath, @"rbc.ini");
+            string file = Path.Combine(MPManager.Simulator.RoutePath, @"etcs.ini");
             if (File.Exists(file))
             {
                 string buffer = new string('\0', 256);
@@ -79,24 +93,24 @@ namespace RBC
 
                 if (length > 0)
                 {
-                    value = (T)Convert.ChangeType(buffer.Trim(), typeof(T), System.Globalization.CultureInfo.InvariantCulture);
+                    value = (T)Convert.ChangeType(buffer.Trim('\0').Trim(), typeof(T), System.Globalization.CultureInfo.InvariantCulture);
                 }
             }
         }
         public void Update()
         {
-            if (RBC_session.Signals == null)
-            {
-                RBC_session.Signals = MPManager.Simulator.Signals;
-            }
-
             try
             {
+                if (RBC_session.Signals == null)
+                {
+                    RBC_session.Signals = MPManager.Simulator.Signals;
+                }
+
                 if (ListenTask == null || ListenTask.IsCompleted)
                 {
                     if (ListenTask != null)
                     {
-                        Connections.Add(new RBC_connection(ListenTask.Result));
+                        Connections.Add(new RBC_connection(ListenTask.Result, this));
                     }
                     ListenTask = Listener.AcceptAsync();
                 }
@@ -149,6 +163,7 @@ namespace RBC
     }
     public class RBC_connection
     {
+        readonly RBC Rbc;
         Socket s;
         RBC_session session;
         enum ConnectionState
@@ -163,9 +178,10 @@ namespace RBC
         public DateTime LastSentMessage;
         public static Dictionary<int, RBC_session> sessions = new Dictionary<int, RBC_session>();
         public bool Active;
-        public RBC_connection(Socket s)
+        public RBC_connection(Socket s, RBC rbc)
         {
             this.s = s;
+            Rbc = rbc;
             s.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
             s.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.NoDelay, true);
             /*s.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, 12);
@@ -223,7 +239,7 @@ namespace RBC
                     State = ConnectionState.WFAU3;
                     byte[] res = new byte[21];
                     res[0] = (byte)((1<<5)|(2<<1)|1);
-                    int rbc=(RBC_session.NID_C<<14)|RBC_session.NID_RBC;
+                    int rbc=(Rbc.NID_C<<14)|Rbc.NID_RBC;
                     for (int i=0; i<3; i++)
                     {
                         res[i+1] = (byte)((rbc>>((2-i)*8))&255);
@@ -259,17 +275,17 @@ namespace RBC
                 }
             }
         }
-        System.UInt16 crc16(byte[] ptr, int count)
+        ushort crc16(byte[] ptr, int count)
         {
-            System.UInt16 crc = 0xFFFF;
+            ushort crc = 0xFFFF;
             for (int i=0; i<count; i++)
             {
-                crc = (System.UInt16)(crc ^ (((System.UInt16)ptr[i]) << 8));
+                crc = (ushort)(crc ^ (((ushort)ptr[i]) << 8));
                 for (int j=0; j<8; j++) {
                     if ((crc & 0x8000) != 0)
-                        crc = (System.UInt16)(crc << 1 ^ 0x1021);
+                        crc = (ushort)(crc << 1 ^ 0x1021);
                     else
-                        crc = (System.UInt16)(crc << 1);
+                        crc = (ushort)(crc << 1);
                 }
             }
             return crc;
@@ -311,7 +327,7 @@ namespace RBC
             if (type == 2)
             {
                 ale[10] = 1;
-                int rbc=(RBC_session.NID_C<<14)|RBC_session.NID_RBC;
+                int rbc=(Rbc.NID_C<<14)|Rbc.NID_RBC;
                 for (int i=0; i<3; i++)
                 {
                     ale[11+i] = (byte)((rbc>>((2-i)*8))&255);
@@ -354,7 +370,7 @@ namespace RBC
                 else
                 {
                     if (s != null) s.Established = s.Establishing = false;
-                    session = new RBC_session(this, nid_engine);
+                    session = new RBC_session(this, Rbc, nid_engine);
                     sessions[nid_engine] = session;
                 }
             }
